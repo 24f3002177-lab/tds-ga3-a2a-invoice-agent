@@ -97,8 +97,8 @@ async def protocol_checks(request: Request, call_next):
 
     if request.method == "POST":
         content_type = request.headers.get("content-type", "").split(";")[0].strip()
-    if content_type != "application/a2a+json":
-        return JSONResponse(status_code=415, content={"error": "Unsupported media type"})
+        if content_type != "application/a2a+json":
+            return JSONResponse(status_code=415, content={"error": "Unsupported media type"})
 
     return await call_next(request)
 

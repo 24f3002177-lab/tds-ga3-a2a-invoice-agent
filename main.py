@@ -198,6 +198,76 @@ async def message_send(request: Request):
             return JSONResponse(status_code=409, content={"error": "IDEMPOTENCY_CONFLICT"})
             
         return {"task": result["task"]}
+        # Look for invoice action results continuation
+    results_data = None
+    for part in parts:
+        if part.get("mediaType") == "application/vnd.ga5.invoice-action-results+json":
+            results_data = part.get("data", {})
+            break
+
+    if results_data:
+        task_id = message.get("taskId")
+        existing_task = storage.get_task(task_id, principal)
+        
+        if not existing_task:
+            return JSONResponse(status_code=404, content={"error": "Task not found"})
+            
+        if existing_task["status"] in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
+            return JSONResponse(status_code=409, content={"error": "Task is already terminal"})
+
+        # Find the original proposals from existing task artifacts
+        original_proposals = []
+        for art in existing_task.get("artifacts", []):
+            if art.get("mediaType") == PROPOSALS:
+                original_proposals = art.get("data", {}).get("proposals", [])
+                break
+
+        # Build executions array containing accepted results only
+        executions = []
+        results = results_data.get("results", [])
+        
+        for res in results:
+            if res.get("outcome") == "ACCEPTED":
+                pkg_id = res.get("packageId")
+                action_id = res.get("actionId")
+                
+                # Match with original proposal
+                matching_prop = next((p for p in original_proposals if p.get("packageId") == pkg_id and p.get("actionId") == action_id), None)
+                if matching_prop:
+                    executions.append({
+                        "packageId": pkg_id,
+                        "actionId": action_id,
+                        "action": res.get("action"),
+                        "receiptNonce": res.get("receiptNonce"),
+                        "facts": matching_prop.get("facts"),
+                        "evidenceRefs": matching_prop.get("evidenceRefs")
+                    })
+
+        # Update task history and state to COMPLETED
+        existing_task["history"].append(message)
+        existing_task["status"] = "TASK_STATE_COMPLETED"
+        existing_task["artifacts"].append({
+            "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
+            "data": {
+                "batchId": results_data.get("batchId"),
+                "executions": executions
+            }
+        })
+
+        # Save the completed task
+        success = storage.save_task(task_id, principal, existing_task.get("contextId"), results_data.get("batchId"), "TASK_STATE_COMPLETED", existing_task)
+        if not success:
+            return JSONResponse(status_code=409, content={"error": "Conflict saving completed task"})
+
+        # Record message deduplication
+        with storage.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO message_dedup (principal, message_id, message_hash, task_id) VALUES (?, ?, ?, ?)",
+                (principal, message_id, digest, task_id)
+            )
+            conn.commit()
+
+        return {"task": existing_task}
     
     return JSONResponse(status_code=400, content={"error": "Unsupported message part type"})
 

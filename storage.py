@@ -3,6 +3,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
+from contextlib import closing
 
 DB_PATH = Path(__file__).with_name("tasks.db")
 DB_LOCK = threading.RLock()
@@ -197,6 +198,38 @@ def list_tasks(principal):
         """, (principal,)).fetchall()
 
     return [json.loads(row["task_json"]) for row in rows]
+
+def update_task_if_status(
+    task_id, principal, expected_status,
+    new_status, task, message_id=None, digest=None,
+):
+    """Change a task only if it is still in expected_status.
+    Returns True if this call won, False if it lost the race."""
+    with closing(connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+
+        cursor = connection.execute("""
+            UPDATE tasks
+            SET status = ?, task_json = ?
+            WHERE task_id = ? AND principal = ? AND status = ?
+        """, (
+            new_status, canonical_json(task),
+            task_id, principal, expected_status,
+        ))
+
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return False
+
+        if message_id is not None:
+            connection.execute("""
+                INSERT OR IGNORE INTO message_dedup (
+                    principal, message_id, message_hash, task_id
+                ) VALUES (?, ?, ?, ?)
+            """, (principal, message_id, digest, task_id))
+
+        connection.commit()
+        return True
 
 
 initialize_database()

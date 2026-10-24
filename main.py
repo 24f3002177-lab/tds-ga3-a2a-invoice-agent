@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import hashlib
 import uuid
@@ -11,12 +12,16 @@ import storage
 
 app = FastAPI(title="A2A Invoice Agent")
 
-BASE_URL = os.getenv("A2A_BASE_URL", "").rstrip("/")
-AGENT_TOKEN = os.getenv("A2A_BEARER_TOKEN", "")
+# Must match, character for character, the URL you submit on the GA page.
+BASE_URL = os.getenv(
+    "A2A_BASE_URL",
+    "https://tds-ga3-a2a-invoice-agent.onrender.com/",
+)
 
 PROPOSALS = "application/vnd.ga5.invoice-action-proposals+json"
 RECEIPTS = "application/vnd.ga5.invoice-action-receipts+json"
 CLAIM_BATCH = "application/vnd.ga5.invoice-claim-batch+json"
+RESULTS = "application/vnd.ga5.invoice-action-results+json"
 
 ACTIONS = {
     "settle_invoice",
@@ -26,31 +31,33 @@ ACTIONS = {
     "open_exception",
 }
 
+BEARER_RE = re.compile(r"^Bearer\s+(\S+)$")
+
+
+def get_principal(request: Request):
+    """Turn the Bearer token into a private user id (a hash)."""
+    match = BEARER_RE.match(request.headers.get("authorization", ""))
+    token = match.group(1) if match else ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
 
 @app.get("/")
 def home():
-    return {
-        "message": "A2A Invoice Agent",
-        "status": "running"
-    }
+    return {"message": "A2A Invoice Agent", "status": "running"}
 
 
 @app.get("/.well-known/agent-card.json")
 def agent_card():
-    base_url = BASE_URL or "https://example.invalid"
-
     return {
         "name": "A2A Invoice Action Agent",
-        "description": (
-            "Evaluates invoice evidence and proposes safe business actions."
-        ),
+        "description": "Evaluates invoice evidence and proposes safe business actions.",
         "version": "1.0.0",
         "capabilities": {},
         "supportedInterfaces": [
             {
-                "url": base_url,
+                "url": BASE_URL,
                 "protocolBinding": "HTTP+JSON",
-                "protocolVersion": "1.0"
+                "protocolVersion": "1.0",
             }
         ],
         "defaultInputModes": [CLAIM_BATCH],
@@ -59,13 +66,10 @@ def agent_card():
             {
                 "id": "invoice_action_agent",
                 "name": "Invoice Action Agent",
-                "description": (
-                    "Evaluates invoice packages and proposes actions "
-                    "supported by documentary evidence."
-                ),
-                "tags": ["invoices", "evidence", "approval", "payments"]
+                "description": "Evaluates invoice packages and proposes actions supported by documentary evidence.",
+                "tags": ["invoices", "evidence", "approval", "payments"],
             }
-        ]
+        ],
     }
 
 
@@ -73,30 +77,22 @@ def agent_card():
 async def protocol_checks(request: Request, call_next):
     path = request.url.path
 
-    # The Agent Card is public. Other API routes require authentication.
-    if path != "/.well-known/agent-card.json" and path != "/":
-        if not AGENT_TOKEN:
-            return JSONResponse(
-                status_code=503,
-                content={"error": "Service authentication is not configured"}
-            )
+    # The Agent Card and home page are public.
+    if path in ("/", "/.well-known/agent-card.json"):
+        return await call_next(request)
 
-        auth_header = request.headers.get("authorization", "")
-        if auth_header != f"Bearer {AGENT_TOKEN}":
-            return JSONResponse(
-                status_code=401,
-                content={"error": "Unauthorized"}
-            )
+    # 1. Any non-empty Bearer token is a valid user.
+    if not BEARER_RE.match(request.headers.get("authorization", "")):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-        if request.headers.get("a2a-version") != "1.0":
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Unsupported A2A version"}
-            )
+    # 2. Version check.
+    if request.headers.get("a2a-version") != "1.0":
+        return JSONResponse(status_code=400, content={"error": "Unsupported A2A version"})
 
+    # 3. POST bodies must be application/a2a+json.
     if request.method == "POST":
-        content_type = request.headers.get("content-type", "").split(";")[0].strip()
-        if content_type != "application/a2a+json":
+        ctype = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if ctype != "application/a2a+json":
             return JSONResponse(status_code=415, content={"error": "Unsupported media type"})
 
     response = await call_next(request)
@@ -160,8 +156,7 @@ def process_invoices_with_ai(packages, batch_id, policy_revision):
 @app.post("/message:send")
 async def message_send(request: Request):
     # Extract the Bearer token to identify the user/principal
-    auth_header = request.headers.get("authorization", "")
-    principal = auth_header.replace("Bearer ", "").strip()
+    principal = get_principal(request)
     
     body = await request.json()
     message = body.get("message", {})
@@ -306,15 +301,13 @@ async def message_send(request: Request):
 
 @app.get("/tasks")
 async def list_tasks(request: Request):
-    auth_header = request.headers.get("authorization", "")
-    principal = auth_header.replace("Bearer ", "").strip()
+    principal = get_principal(request)
     tasks = storage.list_tasks(principal)
     return {"tasks": tasks}
 
 @app.get("/tasks/{task_id}")
 async def get_task(task_id: str, request: Request):
-    auth_header = request.headers.get("authorization", "")
-    principal = auth_header.replace("Bearer ", "").strip()
+    principal = get_principal(request)
     task = storage.get_task(task_id, principal)
     if not task:
         return JSONResponse(status_code=404, content={"error": "Task not found"})
@@ -322,8 +315,7 @@ async def get_task(task_id: str, request: Request):
 
 @app.post("/tasks/{task_id}:cancel")
 async def cancel_task(task_id: str, request: Request):
-    auth_header = request.headers.get("authorization", "")
-    principal = auth_header.replace("Bearer ", "").strip()
+    principal = get_principal(request)
     
     task = storage.get_task(task_id, principal)
     if not task:

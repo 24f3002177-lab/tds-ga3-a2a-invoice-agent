@@ -152,26 +152,34 @@ def proposals_of(task):
 REF_RE = re.compile(r"\[[^\[\]]+\]")
 
 
-AI_MODEL = os.getenv("AI_MODEL", "gpt-4.1-nano")
+from decimal import Decimal
+
+AI_MODEL = os.getenv("AI_MODEL", "gpt-5-mini")
 DECISION_CACHE = {}
 _client = None
 
-SYSTEM_PROMPT = """You are an accounts-payable analyst. For EACH invoice package choose exactly ONE action:
-- settle_invoice: valid, reconciled, and within autonomous approval authority.
-- request_approval: commercially valid but outside delegated approval authority.
+ID_RE = re.compile(r"\[[A-Za-z0-9_\-]{6,}\]")
+COVER_RE = re.compile(
+    r"Supplier\s+(.+?);\s*invoice\s+(\S+?);\s*stated total\s+([A-Z]{3})\s+([\d,]+(?:\.\d+)?)",
+    re.S,
+)
+
+SYSTEM_PROMPT = """You are an accounts-payable analyst. Each package gives a COVER SHEET paragraph (it only identifies the invoice; never cite it) and CANDIDATE PARAGRAPHS that carry bracketed evidence references.
+Choose the ONE candidate paragraph that actually decides what to do with the invoice, and ONE action:
+- settle_invoice: the invoice is valid, reconciled, and within autonomous approval authority.
+- request_approval: commercially valid, but outside delegated approval authority.
 - hold_invoice: payment pauses until a stated verification completes.
-- reject_duplicate: the SAME commercial invoice (same vendor, invoice number, amount) was already paid. A payment for a different invoice is NOT a duplicate.
+- reject_duplicate: the SAME commercial invoice (same vendor, invoice number and amount) was already paid. A payment for a different invoice is NOT a duplicate.
 - open_exception: material records conflict and need an exception workflow.
 
 Rules:
-- Find the paragraph in the package that actually DETERMINES the action. Ignore the cover sheet, archive examples, old/superseded examples, training decoys, and words like 'settle' or 'hold' used in negation or in irrelevant text.
-- Never choose settle_invoice just because you found no problem; settle only if the evidence positively shows it is valid, reconciled and within authority.
-- evidenceRefs: exactly 3 DIFFERENT bracketed references (copied character-for-character, including the brackets) from that deciding paragraph. Not from the cover sheet or examples.
-- facts: vendorName, invoiceNumber, amountMinor (integer, smallest currency unit, e.g. paise or cents), currency (3-letter code), taken from the invoice.
-- reason: 1-3 plain sentences explaining why.
+- Ignore candidates that only quote an old, archived, superseded or training example, or that use an action word in negation (for example 'not a duplicate' or 'no approval needed').
+- Never choose settle_invoice unless the deciding paragraph positively shows the invoice is valid, reconciled and within authority. If in doubt between settle and any other action, do not settle.
+- reason: 1-3 plain sentences explaining why the paragraph leads to the action.
 
-Reply with JSON only: {"decisions":[{"index":0,"action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"..."},"evidenceRefs":["[..]","[..]","[..]"],"reason":"..."}]}
-Return one decision per package, using the package's index."""
+Reply with JSON only:
+{"decisions":[{"index":0,"paragraph":0,"action":"hold_invoice","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"EUR"},"reason":"..."}]}
+One decision per package, using the package index; "paragraph" is the candidate paragraph number."""
 
 
 def get_client():
@@ -187,14 +195,42 @@ def get_client():
     return _client
 
 
-def flatten_text(value):
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        return "\n".join(flatten_text(v) for v in value.values())
-    if isinstance(value, list):
-        return "\n".join(flatten_text(v) for v in value)
-    return ""
+def split_package(pkg):
+    """Return (cover, candidates). cover = (paragraph, regex match) or None."""
+    cover = None
+    candidates = []
+    for doc in pkg.get("documents") or []:
+        if not isinstance(doc, dict):
+            continue
+        text = doc.get("text") or ""
+        for para in re.split(r"\n\s*\n", text):
+            para = para.strip()
+            if not para:
+                continue
+            m = COVER_RE.search(para)
+            if m and cover is None:
+                cover = (para, m)
+                continue
+            refs = list(dict.fromkeys(ID_RE.findall(para)))
+            if refs:
+                candidates.append({"doc": doc.get("name", ""), "text": para, "refs": refs})
+    return cover, candidates
+
+
+def facts_from_cover(cover):
+    if not cover:
+        return None
+    m = cover[1]
+    try:
+        minor = int((Decimal(m.group(4).replace(",", "")) * 100).to_integral_value())
+        return {
+            "vendorName": m.group(1).strip(),
+            "invoiceNumber": m.group(2).strip(),
+            "amountMinor": minor,
+            "currency": m.group(3),
+        }
+    except Exception:
+        return None
 
 
 def package_key(pkg):
@@ -202,25 +238,43 @@ def package_key(pkg):
     return hashlib.sha256(storage.canonical_json(content).encode("utf-8")).hexdigest()
 
 
-def validate_decision(dec, text):
+def pad_refs(refs, pkg):
+    allrefs = list(dict.fromkeys(ID_RE.findall(json.dumps(pkg, ensure_ascii=False))))
+    out = list(refs)
+    for r in allrefs:
+        if len(out) >= 3:
+            break
+        if r not in out:
+            out.append(r)
+    return out[:3]
+
+def build_decision(dec, pkg):
+    """Turn one AI answer into a clean decision, or None if unusable."""
     try:
-        action = dec["action"]
-        refs = dec["evidenceRefs"]
-        facts = dec["facts"]
-        if action not in ACTIONS:
+        cover, cands = split_package(pkg)
+        action = dec.get("action")
+        if action not in ACTIONS or not cands:
             return None
-        if not isinstance(refs, list) or len(refs) != 3 or len(set(refs)) != 3:
+        n = int(dec.get("paragraph"))
+        if not 0 <= n < len(cands):
             return None
-        if any(not isinstance(r, str) or r not in text for r in refs):
+        refs = cands[n]["refs"]
+        if len(refs) != 3:
+            refs = pad_refs(refs[:3], pkg)
+        if len(refs) != 3:
             return None
+        facts = facts_from_cover(cover)
+        if facts is None:
+            f = dec["facts"]
+            facts = {
+                "vendorName": str(f["vendorName"]),
+                "invoiceNumber": str(f["invoiceNumber"]),
+                "amountMinor": int(f["amountMinor"]),
+                "currency": str(f["currency"]).upper(),
+            }
         return {
             "action": action,
-            "facts": {
-                "vendorName": str(facts["vendorName"]),
-                "invoiceNumber": str(facts["invoiceNumber"]),
-                "amountMinor": int(facts["amountMinor"]),
-                "currency": str(facts["currency"]).upper(),
-            },
+            "facts": facts,
             "evidenceRefs": refs,
             "reason": str(dec.get("reason", "")),
         }
@@ -228,31 +282,41 @@ def validate_decision(dec, text):
         return None
 
 
-def fallback_decision(text):
-    refs = list(dict.fromkeys(REF_RE.findall(text)))[:3]
+def fallback_decision(pkg):
+    """If the AI answer is unusable: pause payment, never settle."""
+    cover, cands = split_package(pkg)
+    refs = pad_refs(cands[0]["refs"][:3] if cands else [], pkg)
+    facts = facts_from_cover(cover) or {
+        "vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": "",
+    }
     return {
         "action": "hold_invoice",
-        "facts": {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""},
+        "facts": facts,
         "evidenceRefs": refs,
         "reason": "The documents could not be classified confidently, so payment is paused for verification.",
     }
 
 
 def build_rationale(d):
-    r1, r2, r3 = (d["evidenceRefs"] + ["", "", ""])[:3]
-    text = f"Action {d['action']}: {d['reason']} Decisive evidence: {r1}, {r2} and {r3}."
+    r = (d["evidenceRefs"] + ["", "", ""])[:3]
+    text = f"Action {d['action']}: {d['reason']} Decisive evidence: {r[0]}, {r[1]} and {r[2]}."
     if len(text) < 60:
-        text += " This action follows from the full invoice package."
+        text += " This action follows from the deciding paragraph of the invoice package."
     return text[:1500]
 
+
 def ask_model(items):
-    blocks = [
-        f"=== PACKAGE index={i} ===\n{json.dumps(p, ensure_ascii=False)}"
-        for i, p in items
-    ]
+    blocks = []
+    for i, pkg in items:
+        cover, cands = split_package(pkg)
+        lines = [f"=== PACKAGE index={i} ===",
+                 "COVER SHEET: " + (cover[0] if cover else "(none)")]
+        for n, c in enumerate(cands):
+            lines.append(f"CANDIDATE PARAGRAPH {n} (from {c['doc']}): {c['text']}")
+        blocks.append("\n".join(lines))
     response = get_client().chat.completions.create(
         model=AI_MODEL,
-        reasoning_effort="minimal",
+        reasoning_effort="low",
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -265,7 +329,6 @@ def ask_model(items):
 
 def decide_batch(packages, batch_id, policy_revision):
     keys = [package_key(p) for p in packages]
-    texts = [flatten_text(p) for p in packages]
     local = {}
     missing = [(i, packages[i]) for i, k in enumerate(keys) if k not in DECISION_CACHE]
 
@@ -275,13 +338,18 @@ def decide_batch(packages, batch_id, policy_revision):
         except Exception as exc:
             print("AI CALL FAILED:", repr(exc))
             answers = {}
-        for i, _pkg in missing:
-            clean = validate_decision(answers.get(i, {}), texts[i])
+        for i, pkg in missing:
+            clean = build_decision(answers.get(i, {}), pkg)
             if clean is None:
                 print("BAD OR MISSING AI DECISION for package", i, "- using safe fallback")
-                local[keys[i]] = fallback_decision(texts[i])
+                local[keys[i]] = fallback_decision(pkg)
             else:
                 DECISION_CACHE[keys[i]] = clean
+            if i < 4:
+                cover, cands = split_package(pkg)
+                for n, c in enumerate(cands):
+                    print("CAND", i, n, c["doc"], c["text"][:600])
+                print("DECISION", i, (DECISION_CACHE.get(keys[i]) or local[keys[i]])["action"])
 
     proposals = []
     for i, pkg in enumerate(packages):
@@ -294,12 +362,7 @@ def decide_batch(packages, batch_id, policy_revision):
             "evidenceRefs": d["evidenceRefs"],
             "rationale": build_rationale(d),
         })
-
-    if packages:
-        print("FIRST PACKAGE KEYS:", list(packages[0].keys()))
-        print("FIRST PACKAGE SAMPLE:", json.dumps(packages[0], ensure_ascii=False)[:1500])
     return proposals
-
 @app.post("/message:send")
 async def message_send(request: Request):
     principal = get_principal(request)

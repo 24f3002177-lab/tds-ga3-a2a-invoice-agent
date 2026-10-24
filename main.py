@@ -100,7 +100,9 @@ async def protocol_checks(request: Request, call_next):
         if content_type != "application/a2a+json":
             return JSONResponse(status_code=415, content={"error": "Unsupported media type"})
 
-    return await call_next(request)
+    response = await call_next(request)
+    response.headers["Content-Type"] = "application/a2a+json"
+    return response
 
 def process_invoices_with_ai(packages, batch_id, policy_revision):
     # Here you can integrate your LLM call (OpenAI, Gemini, etc.) 

@@ -1,4 +1,6 @@
 import os
+import asyncio
+import copy
 import re
 import json
 import hashlib
@@ -99,234 +101,239 @@ async def protocol_checks(request: Request, call_next):
     response.headers["Content-Type"] = "application/a2a+json"
     return response
 
-def process_invoices_with_ai(packages, batch_id, policy_revision):
+STATE_INPUT = "TASK_STATE_INPUT_REQUIRED"
+STATE_DONE = "TASK_STATE_COMPLETED"
+STATE_CANCELED = "TASK_STATE_CANCELED"
+RESULTS_PART_OK = ("ACCEPTED", "REJECTED")
+NONTERMINAL = {"TASK_STATE_SUBMITTED", "TASK_STATE_WORKING", STATE_INPUT}
+
+_locks = {}
+
+
+def key_lock(key):
+    return _locks.setdefault(key, asyncio.Lock())
+
+
+def err(status, reason):
+    # Generic body: never echoes ids or reveals who owns what.
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"code": status, "reason": reason, "message": reason}},
+    )
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def make_artifact(name, media_type, data):
+    return {
+        "artifactId": str(uuid.uuid4()),
+        "name": name,
+        "parts": [{"mediaType": media_type, "data": data}],
+    }
+
+
+def find_part(message, media_type):
+    for part in message.get("parts") or []:
+        if isinstance(part, dict) and part.get("mediaType") == media_type:
+            return part.get("data")
+    return None
+
+
+def proposals_of(task):
+    for art in task.get("artifacts") or []:
+        for part in art.get("parts") or []:
+            if part.get("mediaType") == PROPOSALS:
+                return part.get("data") or {}
+    return {}
+
+
+REF_RE = re.compile(r"\[[^\[\]]+\]")
+
+
+def decide_batch(packages, batch_id, policy_revision):
+    """TEMPORARY stand-in. Piece 3 replaces this with the real AI step.
+    Do NOT spend a GA3 Check while this is still here."""
     proposals = []
-    
     for pkg in packages:
-        package_id = pkg.get("packageId")
-        evidences = pkg.get("evidence", [])
-        
-        # Extract evidence IDs (must cite decisive evidence IDs)
-        evidence_ids = [e.get("id") or e.get("evidenceId") for e in evidences if (e.get("id") or e.get("evidenceId"))]
-        
-        # Fallback to ensure we have at least 3 evidence references cited
-        while len(evidence_ids) < 3:
-            evidence_ids.append(f"ev-ref-{len(evidence_ids) + 1}")
-        cited_evidence_ids = evidence_ids[:3]
-
-        # Extract invoice metadata
-        amount = pkg.get("amount", 0)
-        is_duplicate = pkg.get("isDuplicate", False)
-        has_approval_override = pkg.get("hasApprovalOverride", False)
-        
-        # Decide the appropriate business action based on policy rules
-        if is_duplicate:
-            action = "reject_duplicate"
-            rationale = (
-                f"Action chosen: reject_duplicate. The invoice package {package_id} was flagged as a duplicate "
-                f"entry during policy evaluation. Citations: {cited_evidence_ids[0]}, {cited_evidence_ids[1]}, and {cited_evidence_ids[2]}."
-            )
-        elif amount > 10000 and not has_approval_override:
-            action = "request_approval"
-            rationale = (
-                f"Action chosen: request_approval. Total amount of ${amount} exceeds automated threshold limit of $10,000. "
-                f"Supported by evidence references {cited_evidence_ids[0]}, {cited_evidence_ids[1]}, and {cited_evidence_ids[2]}."
-            )
-        elif pkg.get("discrepancyFound", False):
-            action = "hold_invoice"
-            rationale = (
-                f"Action chosen: hold_invoice. Line item billing discrepancy identified across submitted documentation. "
-                f"Evidence cited: {cited_evidence_ids[0]}, {cited_evidence_ids[1]}, and {cited_evidence_ids[2]}."
-            )
-        else:
-            action = "settle_invoice"
-            rationale = (
-                f"Action chosen: settle_invoice. Invoice complies with policy limits and has been verified. "
-                f"Citations: {cited_evidence_ids[0]}, {cited_evidence_ids[1]}, and {cited_evidence_ids[2]}."
-            )
-
+        text = json.dumps(pkg, ensure_ascii=False)
+        refs = list(dict.fromkeys(REF_RE.findall(text)))[:3]
         proposals.append({
-            "packageId": package_id,
-            "action": action,
-            "evidenceIds": cited_evidence_ids,
-            "rationale": rationale
+            "packageId": pkg.get("packageId") or pkg.get("id"),
+            "actionId": "act-" + uuid.uuid4().hex,
+            "action": "hold_invoice",
+            "facts": {"vendorName": "", "invoiceNumber": "",
+                      "amountMinor": 0, "currency": ""},
+            "evidenceRefs": refs,
+            "rationale": "Placeholder rationale used only while testing the protocol plumbing of this agent. " * 2,
         })
-
+    if packages:
+        print("FIRST PACKAGE KEYS:", list(packages[0].keys()))
+        print("FIRST PACKAGE SAMPLE:", json.dumps(packages[0])[:1500])
     return proposals
+
+
 @app.post("/message:send")
 async def message_send(request: Request):
-    # Extract the Bearer token to identify the user/principal
     principal = get_principal(request)
-    
-    body = await request.json()
-    message = body.get("message", {})
-    message_id = message.get("messageId")
-    
-    if not message_id:
-        return JSONResponse(status_code=400, content={"error": "Missing messageId"})
+    try:
+        body = await request.json()
+    except Exception:
+        return err(400, "INVALID_JSON")
 
-    # 1. Check if this is a replay or conflict using storage.py
+    message = body.get("message") if isinstance(body, dict) else None
+    if not isinstance(message, dict) or not message.get("messageId"):
+        return err(400, "INVALID_MESSAGE")
+
+    message_id = str(message["messageId"])
     digest = storage.message_hash(message)
+
     existing = storage.get_existing_message(principal, message_id)
-    
     if existing:
         if existing["message_hash"] != digest:
-            return JSONResponse(status_code=409, content={"error": "IDEMPOTENCY_CONFLICT"})
-        # Replay: return the existing task
+            return err(409, "IDEMPOTENCY_CONFLICT")
         return {"task": existing["task"]}
 
-    # 2. Check if this is a result continuation from the grader or an initial batch request
-    parts = message.get("parts", [])
-    task_id = message.get("taskId") or str(uuid.uuid4())
-    context_id = message.get("contextId", str(uuid.uuid4()))
-    
-    # Look for invoice claim batch
-    batch_data = None
-    for part in parts:
-        if part.get("mediaType") == CLAIM_BATCH:
-            batch_data = part.get("data", {})
-            break
+    results_data = find_part(message, RESULTS)
+    if results_data is not None:
+        return await handle_results(principal, message, message_id, digest, results_data)
 
-    if batch_data:
-        # Initial Request: Run AI to generate proposals
-        batch_id = batch_data.get("batchId")
-        policy_revision = batch_data.get("policyRevision")
-        packages = batch_data.get("packages", [])
-        
-        proposals = process_invoices_with_ai(packages, batch_id, policy_revision)
-        
-        # Build the Task object in TASK_STATE_INPUT_REQUIRED
-        task_obj = {
-            "taskId": task_id,
-            "contextId": context_id,
-            "status": "TASK_STATE_INPUT_REQUIRED",
-            "history": [message],
-            "artifacts": [{
-                "mediaType": PROPOSALS,
-                "data": {
-                    "batchId": batch_id,
-                    "proposals": proposals
-                }
-            }]
-        }
-        
-        # Atomically save task and register message deduplication
-        result = storage.create_task_once(
-            principal=principal,
-            message_id=message_id,
-            digest=digest,
-            task_id=task_id,
-            context_id=context_id,
-            batch_id=batch_id,
-            status="TASK_STATE_INPUT_REQUIRED",
-            task=task_obj
+    batch_data = find_part(message, CLAIM_BATCH)
+    if not isinstance(batch_data, dict):
+        return err(400, "UNSUPPORTED_MESSAGE")
+
+    batch_id = batch_data.get("batchId")
+    packages = batch_data.get("packages")
+    if not batch_id or not isinstance(packages, list):
+        return err(400, "INVALID_BATCH")
+
+    async with key_lock((principal, message_id)):
+        existing = storage.get_existing_message(principal, message_id)
+        if existing:
+            if existing["message_hash"] != digest:
+                return err(409, "IDEMPOTENCY_CONFLICT")
+            return {"task": existing["task"]}
+
+        proposals = await asyncio.to_thread(
+            decide_batch, packages, batch_id, batch_data.get("policyRevision")
         )
-        
+        task_id = str(uuid.uuid4())
+        context_id = str(message.get("contextId") or uuid.uuid4())
+        task = {
+            "id": task_id,
+            "contextId": context_id,
+            "status": {"state": STATE_INPUT, "timestamp": now_iso()},
+            "artifacts": [make_artifact(
+                "invoice-action-proposals", PROPOSALS,
+                {"batchId": batch_id, "proposals": proposals},
+            )],
+            "history": [message],
+        }
+        result = storage.create_task_once(
+            principal=principal, message_id=message_id, digest=digest,
+            task_id=task_id, context_id=context_id, batch_id=str(batch_id),
+            status=STATE_INPUT, task=task,
+        )
         if result["kind"] == "conflict":
-            return JSONResponse(status_code=409, content={"error": "IDEMPOTENCY_CONFLICT"})
-            
+            return err(409, "IDEMPOTENCY_CONFLICT")
         return {"task": result["task"]}
-        # Look for invoice action results continuation
-    results_data = None
-    for part in parts:
-        if part.get("mediaType") == "application/vnd.ga5.invoice-action-results+json":
-            results_data = part.get("data", {})
-            break
 
-    if results_data:
-        task_id = message.get("taskId")
-        existing_task = storage.get_task(task_id, principal)
-        
-        if not existing_task:
-            return JSONResponse(status_code=404, content={"error": "Task not found"})
-            
-        if existing_task["status"] in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
-            return JSONResponse(status_code=409, content={"error": "Task is already terminal"})
 
-        # Find the original proposals from existing task artifacts
-        original_proposals = []
-        for art in existing_task.get("artifacts", []):
-            if art.get("mediaType") == PROPOSALS:
-                original_proposals = art.get("data", {}).get("proposals", [])
-                break
+async def handle_results(principal, message, message_id, digest, data):
+    task_id = message.get("taskId")
+    task = storage.get_task(task_id, principal) if isinstance(task_id, str) else None
+    if task is None:
+        return err(404, "TASK_NOT_FOUND")
+    if task["status"]["state"] != STATE_INPUT:
+        return err(409, "TASK_NOT_ACTIVE")
+    if message.get("contextId") != task.get("contextId"):
+        return err(400, "CONTINUATION_MISMATCH")
 
-        # Build executions array containing accepted results only
-        executions = []
-        results = results_data.get("results", [])
-        
-        for res in results:
-            if res.get("outcome") == "ACCEPTED":
-                pkg_id = res.get("packageId")
-                action_id = res.get("actionId")
-                
-                # Match with original proposal
-                matching_prop = next((p for p in original_proposals if p.get("packageId") == pkg_id and p.get("actionId") == action_id), None)
-                if matching_prop:
-                    executions.append({
-                        "packageId": pkg_id,
-                        "actionId": action_id,
-                        "action": res.get("action"),
-                        "receiptNonce": res.get("receiptNonce"),
-                        "facts": matching_prop.get("facts"),
-                        "evidenceRefs": matching_prop.get("evidenceRefs")
-                    })
+    stored = proposals_of(task)
+    if not isinstance(data, dict) or data.get("batchId") != stored.get("batchId"):
+        return err(400, "CONTINUATION_MISMATCH")
 
-        # Update task history and state to COMPLETED
-        existing_task["history"].append(message)
-        existing_task["status"] = "TASK_STATE_COMPLETED"
-        existing_task["artifacts"].append({
-            "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
-            "data": {
-                "batchId": results_data.get("batchId"),
-                "executions": executions
-            }
-        })
+    results = data.get("results")
+    if not isinstance(results, list):
+        return err(400, "CONTINUATION_MISMATCH")
 
-        # Save the completed task
-        success = storage.save_task(task_id, principal, existing_task.get("contextId"), results_data.get("batchId"), "TASK_STATE_COMPLETED", existing_task)
-        if not success:
-            return JSONResponse(status_code=409, content={"error": "Conflict saving completed task"})
+    by_package = {p["packageId"]: p for p in stored.get("proposals", [])}
+    seen = set()
+    executions = []
+    for res in results:
+        if not isinstance(res, dict):
+            return err(400, "CONTINUATION_MISMATCH")
+        pkg_id = res.get("packageId")
+        prop = by_package.get(pkg_id)
+        if prop is None or pkg_id in seen:
+            return err(400, "CONTINUATION_MISMATCH")
+        seen.add(pkg_id)
+        if res.get("actionId") != prop["actionId"] or res.get("action") != prop["action"]:
+            return err(400, "CONTINUATION_MISMATCH")
+        outcome = res.get("outcome")
+        if outcome not in RESULTS_PART_OK:
+            return err(400, "CONTINUATION_MISMATCH")
+        if outcome == "ACCEPTED":
+            nonce = res.get("receiptNonce")
+            if not isinstance(nonce, str) or not nonce:
+                return err(400, "CONTINUATION_MISMATCH")
+            executions.append({
+                "packageId": pkg_id,
+                "actionId": prop["actionId"],
+                "action": prop["action"],
+                "receiptNonce": nonce,
+                "facts": prop["facts"],
+                "evidenceRefs": prop["evidenceRefs"],
+            })
 
-        # Record message deduplication
-        with storage.connect() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO message_dedup (principal, message_id, message_hash, task_id) VALUES (?, ?, ?, ?)",
-                (principal, message_id, digest, task_id)
-            )
-            conn.commit()
+    new_task = copy.deepcopy(task)
+    new_task["status"] = {"state": STATE_DONE, "timestamp": now_iso()}
+    new_task["history"].append(message)
+    new_task["artifacts"].append(make_artifact(
+        "invoice-action-receipts", RECEIPTS,
+        {"batchId": stored.get("batchId"), "executions": executions},
+    ))
 
-        return {"task": existing_task}
-    
-    return JSONResponse(status_code=400, content={"error": "Unsupported message part type"})
+    won = storage.update_task_if_status(
+        task_id, principal, STATE_INPUT, STATE_DONE,
+        new_task, message_id, digest,
+    )
+    if not won:
+        existing = storage.get_existing_message(principal, message_id)
+        if existing and existing["message_hash"] == digest:
+            return {"task": existing["task"]}
+        return err(409, "TASK_NOT_ACTIVE")
+    return {"task": new_task}
+
 
 @app.get("/tasks")
 async def list_tasks(request: Request):
-    principal = get_principal(request)
-    tasks = storage.list_tasks(principal)
-    return {"tasks": tasks}
+    return {"tasks": storage.list_tasks(get_principal(request))}
+
 
 @app.get("/tasks/{task_id}")
 async def get_task(task_id: str, request: Request):
-    principal = get_principal(request)
-    task = storage.get_task(task_id, principal)
+    task = storage.get_task(task_id, get_principal(request))
     if not task:
-        return JSONResponse(status_code=404, content={"error": "Task not found"})
+        return err(404, "TASK_NOT_FOUND")
     return task
 
 @app.post("/tasks/{task_id}:cancel")
 async def cancel_task(task_id: str, request: Request):
     principal = get_principal(request)
-    
     task = storage.get_task(task_id, principal)
     if not task:
-        return JSONResponse(status_code=404, content={"error": "Task not found"})
-        
-    if task["status"] in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
-        return JSONResponse(status_code=409, content={"error": "Task is already terminal"})
-        
-    task["status"] = "TASK_STATE_CANCELED"
-    success = storage.save_task(task_id, principal, task.get("contextId"), task.get("batchId"), "TASK_STATE_CANCELED", task)
-    if not success:
-        return JSONResponse(status_code=409, content={"error": "Conflict during cancellation"})
-        
-    return task
+        return err(404, "TASK_NOT_FOUND")
+
+    current = task["status"]["state"]
+    if current not in NONTERMINAL:
+        return err(409, "TASK_NOT_CANCELABLE")
+
+    new_task = copy.deepcopy(task)
+    new_task["status"] = {"state": STATE_CANCELED, "timestamp": now_iso()}
+    if not storage.update_task_if_status(
+        task_id, principal, current, STATE_CANCELED, new_task
+    ):
+        return err(409, "TASK_NOT_CANCELABLE")
+    return new_task

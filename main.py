@@ -252,7 +252,7 @@ def ask_model(items):
     ]
     response = get_client().chat.completions.create(
         model=AI_MODEL,
-        temperature=0,
+        reasoning_effort="minimal",
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},

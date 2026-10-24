@@ -101,3 +101,137 @@ async def protocol_checks(request: Request, call_next):
         return JSONResponse(status_code=415, content={"error": "Unsupported media type"})
 
     return await call_next(request)
+import uuid
+
+def process_invoices_with_ai(packages, batch_id, policy_revision):
+    # Here you can integrate your LLM call (OpenAI, Gemini, etc.) 
+    # For each package in the batch, generate the required proposal structure:
+    proposals = []
+    for pkg in packages:
+        package_id = pkg.get("packageId")
+        # Example proposal structure required by the assignment:
+        proposals.append({
+            "packageId": package_id,
+            "actionId": str(uuid.uuid4()).replace("-", "")[:12], # At least 12 chars unique ID
+            "action": "settle_invoice", # Replace with actual AI decision logic
+            "facts": {
+                "vendorName": pkg.get("vendorName", "Sample Vendor"),
+                "invoiceNumber": pkg.get("invoiceNumber", "INV-001"),
+                "amountMinor": pkg.get("amountMinor", 1000),
+                "currency": pkg.get("currency", "INR")
+            },
+            "evidenceRefs": ["exact reference 1", "exact reference 2", "exact reference 3"],
+            "rationale": "The invoice is fully verified, valid, reconciled, and within autonomous authority limits."
+        })
+    return proposals
+@app.post("/message:send")
+async def message_send(request: Request):
+    # Extract the Bearer token to identify the user/principal
+    auth_header = request.headers.get("authorization", "")
+    principal = auth_header.replace("Bearer ", "").strip()
+    
+    body = await request.json()
+    message = body.get("message", {})
+    message_id = message.get("messageId")
+    
+    if not message_id:
+        return JSONResponse(status_code=400, content={"error": "Missing messageId"})
+
+    # 1. Check if this is a replay or conflict using storage.py
+    digest = storage.message_hash(message)
+    existing = storage.get_existing_message(principal, message_id)
+    
+    if existing:
+        if existing["message_hash"] != digest:
+            return JSONResponse(status_code=409, content={"error": "IDEMPOTENCY_CONFLICT"})
+        # Replay: return the existing task
+        return {"task": existing["task"]}
+
+    # 2. Check if this is a result continuation from the grader or an initial batch request
+    parts = message.get("parts", [])
+    task_id = message.get("taskId") or str(uuid.uuid4())
+    context_id = message.get("contextId", str(uuid.uuid4()))
+    
+    # Look for invoice claim batch
+    batch_data = None
+    for part in parts:
+        if part.get("mediaType") == CLAIM_BATCH:
+            batch_data = part.get("data", {})
+            break
+
+    if batch_data:
+        # Initial Request: Run AI to generate proposals
+        batch_id = batch_data.get("batchId")
+        policy_revision = batch_data.get("policyRevision")
+        packages = batch_data.get("packages", [])
+        
+        proposals = process_invoices_with_ai(packages, batch_id, policy_revision)
+        
+        # Build the Task object in TASK_STATE_INPUT_REQUIRED
+        task_obj = {
+            "taskId": task_id,
+            "contextId": context_id,
+            "status": "TASK_STATE_INPUT_REQUIRED",
+            "history": [message],
+            "artifacts": [{
+                "mediaType": PROPOSALS,
+                "data": {
+                    "batchId": batch_id,
+                    "proposals": proposals
+                }
+            }]
+        }
+        
+        # Atomically save task and register message deduplication
+        result = storage.create_task_once(
+            principal=principal,
+            message_id=message_id,
+            digest=digest,
+            task_id=task_id,
+            context_id=context_id,
+            batch_id=batch_id,
+            status="TASK_STATE_INPUT_REQUIRED",
+            task=task_obj
+        )
+        
+        if result["kind"] == "conflict":
+            return JSONResponse(status_code=409, content={"error": "IDEMPOTENCY_CONFLICT"})
+            
+        return {"task": result["task"]}
+    
+    return JSONResponse(status_code=400, content={"error": "Unsupported message part type"})
+
+@app.get("/tasks")
+async def list_tasks(request: Request):
+    auth_header = request.headers.get("authorization", "")
+    principal = auth_header.replace("Bearer ", "").strip()
+    tasks = storage.list_tasks(principal)
+    return {"tasks": tasks}
+
+@app.get("/tasks/{task_id}")
+async def get_task(task_id: str, request: Request):
+    auth_header = request.headers.get("authorization", "")
+    principal = auth_header.replace("Bearer ", "").strip()
+    task = storage.get_task(task_id, principal)
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "Task not found"})
+    return task
+
+@app.post("/tasks/{task_id}:cancel")
+async def cancel_task(task_id: str, request: Request):
+    auth_header = request.headers.get("authorization", "")
+    principal = auth_header.replace("Bearer ", "").strip()
+    
+    task = storage.get_task(task_id, principal)
+    if not task:
+        return JSONResponse(status_code=404, content={"error": "Task not found"})
+        
+    if task["status"] in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
+        return JSONResponse(status_code=409, content={"error": "Task is already terminal"})
+        
+    task["status"] = "TASK_STATE_CANCELED"
+    success = storage.save_task(task_id, principal, task.get("contextId"), task.get("batchId"), "TASK_STATE_CANCELED", task)
+    if not success:
+        return JSONResponse(status_code=409, content={"error": "Conflict during cancellation"})
+        
+    return task

@@ -4,7 +4,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-DB_PATH = Path(file).with_name("tasks.db")
+DB_PATH = Path(__file__).with_name("tasks.db")
 DB_LOCK = threading.RLock()
 
 

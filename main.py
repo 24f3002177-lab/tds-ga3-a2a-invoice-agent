@@ -152,27 +152,153 @@ def proposals_of(task):
 REF_RE = re.compile(r"\[[^\[\]]+\]")
 
 
+AI_MODEL = os.getenv("AI_MODEL", "gpt-4.1-nano")
+DECISION_CACHE = {}
+_client = None
+
+SYSTEM_PROMPT = """You are an accounts-payable analyst. For EACH invoice package choose exactly ONE action:
+- settle_invoice: valid, reconciled, and within autonomous approval authority.
+- request_approval: commercially valid but outside delegated approval authority.
+- hold_invoice: payment pauses until a stated verification completes.
+- reject_duplicate: the SAME commercial invoice (same vendor, invoice number, amount) was already paid. A payment for a different invoice is NOT a duplicate.
+- open_exception: material records conflict and need an exception workflow.
+
+Rules:
+- Find the paragraph in the package that actually DETERMINES the action. Ignore the cover sheet, archive examples, old/superseded examples, training decoys, and words like 'settle' or 'hold' used in negation or in irrelevant text.
+- Never choose settle_invoice just because you found no problem; settle only if the evidence positively shows it is valid, reconciled and within authority.
+- evidenceRefs: exactly 3 DIFFERENT bracketed references (copied character-for-character, including the brackets) from that deciding paragraph. Not from the cover sheet or examples.
+- facts: vendorName, invoiceNumber, amountMinor (integer, smallest currency unit, e.g. paise or cents), currency (3-letter code), taken from the invoice.
+- reason: 1-3 plain sentences explaining why.
+
+Reply with JSON only: {"decisions":[{"index":0,"action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"..."},"evidenceRefs":["[..]","[..]","[..]"],"reason":"..."}]}
+Return one decision per package, using the package's index."""
+
+
+def get_client():
+    global _client
+    if _client is None:
+        from openai import OpenAI
+        _client = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY", ""),
+            base_url=os.getenv("OPENAI_BASE_URL", "https://aipipe.org/openai/v1"),
+            timeout=38,
+            max_retries=0,
+        )
+    return _client
+
+
+def flatten_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return "\n".join(flatten_text(v) for v in value.values())
+    if isinstance(value, list):
+        return "\n".join(flatten_text(v) for v in value)
+    return ""
+
+
+def package_key(pkg):
+    content = {k: v for k, v in pkg.items() if k not in ("packageId", "id")}
+    return hashlib.sha256(storage.canonical_json(content).encode("utf-8")).hexdigest()
+
+
+def validate_decision(dec, text):
+    try:
+        action = dec["action"]
+        refs = dec["evidenceRefs"]
+        facts = dec["facts"]
+        if action not in ACTIONS:
+            return None
+        if not isinstance(refs, list) or len(refs) != 3 or len(set(refs)) != 3:
+            return None
+        if any(not isinstance(r, str) or r not in text for r in refs):
+            return None
+        return {
+            "action": action,
+            "facts": {
+                "vendorName": str(facts["vendorName"]),
+                "invoiceNumber": str(facts["invoiceNumber"]),
+                "amountMinor": int(facts["amountMinor"]),
+                "currency": str(facts["currency"]).upper(),
+            },
+            "evidenceRefs": refs,
+            "reason": str(dec.get("reason", "")),
+        }
+    except Exception:
+        return None
+
+
+def fallback_decision(text):
+    refs = list(dict.fromkeys(REF_RE.findall(text)))[:3]
+    return {
+        "action": "hold_invoice",
+        "facts": {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""},
+        "evidenceRefs": refs,
+        "reason": "The documents could not be classified confidently, so payment is paused for verification.",
+    }
+
+
+def build_rationale(d):
+    r1, r2, r3 = (d["evidenceRefs"] + ["", "", ""])[:3]
+    text = f"Action {d['action']}: {d['reason']} Decisive evidence: {r1}, {r2} and {r3}."
+    if len(text) < 60:
+        text += " This action follows from the full invoice package."
+    return text[:1500]
+
+def ask_model(items):
+    blocks = [
+        f"=== PACKAGE index={i} ===\n{json.dumps(p, ensure_ascii=False)}"
+        for i, p in items
+    ]
+    response = get_client().chat.completions.create(
+        model=AI_MODEL,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "\n\n".join(blocks)},
+        ],
+    )
+    data = json.loads(response.choices[0].message.content)
+    return {d.get("index"): d for d in data.get("decisions", []) if isinstance(d, dict)}
+
+
 def decide_batch(packages, batch_id, policy_revision):
-    """TEMPORARY stand-in. Piece 3 replaces this with the real AI step.
-    Do NOT spend a GA3 Check while this is still here."""
+    keys = [package_key(p) for p in packages]
+    texts = [flatten_text(p) for p in packages]
+    local = {}
+    missing = [(i, packages[i]) for i, k in enumerate(keys) if k not in DECISION_CACHE]
+
+    if missing:
+        try:
+            answers = ask_model(missing)
+        except Exception as exc:
+            print("AI CALL FAILED:", repr(exc))
+            answers = {}
+        for i, _pkg in missing:
+            clean = validate_decision(answers.get(i, {}), texts[i])
+            if clean is None:
+                print("BAD OR MISSING AI DECISION for package", i, "- using safe fallback")
+                local[keys[i]] = fallback_decision(texts[i])
+            else:
+                DECISION_CACHE[keys[i]] = clean
+
     proposals = []
-    for pkg in packages:
-        text = json.dumps(pkg, ensure_ascii=False)
-        refs = list(dict.fromkeys(REF_RE.findall(text)))[:3]
+    for i, pkg in enumerate(packages):
+        d = DECISION_CACHE.get(keys[i]) or local[keys[i]]
         proposals.append({
             "packageId": pkg.get("packageId") or pkg.get("id"),
             "actionId": "act-" + uuid.uuid4().hex,
-            "action": "hold_invoice",
-            "facts": {"vendorName": "", "invoiceNumber": "",
-                      "amountMinor": 0, "currency": ""},
-            "evidenceRefs": refs,
-            "rationale": "Placeholder rationale used only while testing the protocol plumbing of this agent. " * 2,
+            "action": d["action"],
+            "facts": d["facts"],
+            "evidenceRefs": d["evidenceRefs"],
+            "rationale": build_rationale(d),
         })
+
     if packages:
         print("FIRST PACKAGE KEYS:", list(packages[0].keys()))
-        print("FIRST PACKAGE SAMPLE:", json.dumps(packages[0])[:1500])
+        print("FIRST PACKAGE SAMPLE:", json.dumps(packages[0], ensure_ascii=False)[:1500])
     return proposals
-
 
 @app.post("/message:send")
 async def message_send(request: Request):
